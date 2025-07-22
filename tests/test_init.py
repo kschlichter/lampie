@@ -14,7 +14,7 @@ from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, ServiceCall
 from homeassistant.helpers import (
     device_registry as dr,
     entity_registry as er,
@@ -303,11 +303,23 @@ async def _setup(
     zwave_cluster_commands = async_mock_service(
         hass, "zwave_js", "bulk_set_partial_config_parameters"
     )
+    matter_cluster_commands: list[ServiceCall] = []
+    hass.services.async_register(
+        "light",
+        "turn_on",
+        matter_cluster_commands.append,
+    )
+    hass.services.async_register(
+        "light",
+        "turn_off",
+        matter_cluster_commands.append,
+    )
 
     cluster_commands = {
         Integration.ZHA: zha_cluster_commands,
         Integration.Z2M: mqtt_publish_commands,
         Integration.ZWAVE: zwave_cluster_commands,
+        Integration.MATTER: matter_cluster_commands,
     }[integration_domain]
 
     # configure switch attributes for switches that will be added.
@@ -592,6 +604,33 @@ async def _steps(
                     },
                 )
 
+            for step in step_events if integration_domain == Integration.MATTER else []:
+                event_data = {**step["event"]}
+                command = event_data.pop("command")
+                entity_id = event_data.pop("entity_id", None)
+
+                if entity_id is None and standard_switch is not None:
+                    entity_id = standard_switch.entity_id
+
+                # if supplied, get the device related to the entity_id instead
+                if entity_id is not None:
+                    device_id = entity_registry.async_get(entity_id).device_id
+
+                object_id = entity_id.split(".", 1)[1]
+                unsupported_press = (f"event.{object_id}_up", "press")
+                entity_id, event_type = {
+                    "button_3_double": (f"event.{object_id}_config", "multi_press_2"),
+                }.get(command) or unsupported_press
+
+                hass.bus.async_fire(
+                    "state_changed",
+                    {
+                        "entity_id": entity_id,
+                        "new_state": {"attributes": {"event_type": event_type}},
+                        **event_data,
+                    },
+                )
+
             await hass.async_block_till_done()
 
         # capture service calls to assert about start/end action invocations
@@ -604,6 +643,8 @@ async def _steps(
                 ("zha", "issue_zigbee_cluster_command"),
                 ("mqtt", "publish"),
                 ("zwave_js", "bulk_set_partial_config_parameters"),
+                ("light", "turn_on"),
+                ("light", "turn_off"),
             }
         ]
 
@@ -910,6 +951,13 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
                     },
                     "expected_events": 0,
                 },
+                Integration.MATTER: {  # command unsupported for MATTER
+                    "expected_states": {"switch.doors_open_notification": "on"},
+                    "expected_timers": {
+                        "notification|doors_open": True,
+                    },
+                    "expected_events": 0,
+                },
             },
             "expected_states": {"switch.doors_open_notification": "off"},
             "expected_timers": {
@@ -979,6 +1027,14 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
                         "notification|doors_open": True,
                         "switch|fan.kitchen": False,
                         "switch|light.kitchen": None,
+                    },
+                    "expected_events": 0,
+                    "expected_cluster_commands": 1,  # only one LED to use
+                },
+                Integration.MATTER: {  # command unsupported for MATTER
+                    "expected_states": {"switch.doors_open_notification": "on"},
+                    "expected_timers": {
+                        "notification|doors_open": True,
                     },
                     "expected_events": 0,
                     "expected_cluster_commands": 1,  # only one LED to use
@@ -1069,6 +1125,9 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
                 (Integration.ZWAVE, "LZW36"): {
                     "expected_cluster_commands": 1,  # only one LED to use
                 },
+                Integration.MATTER: {
+                    "expected_cluster_commands": 1,  # only one LED to use
+                },
             },
             "expected_states": {"switch.doors_open_notification": "on"},
             "expected_timers": {
@@ -1105,6 +1164,9 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
             ],
             "integration_overrides": {
                 (Integration.ZWAVE, "LZW36"): {
+                    "expected_cluster_commands": 2,  # only one LED to use
+                },
+                Integration.MATTER: {
                     "expected_cluster_commands": 2,  # only one LED to use
                 },
             },
@@ -1165,6 +1227,9 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
             ],
             "integration_overrides": {
                 Integration.ZWAVE: {  # local protection & 2x tap flag unsupported for ZWAVE
+                    "expected_cluster_commands": 1,
+                },
+                Integration.MATTER: {  # local protection & 2x tap flag unsupported for MATTER
                     "expected_cluster_commands": 1,
                 },
             },
@@ -1599,6 +1664,9 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
                 (Integration.ZWAVE, "LZW36"): {
                     "expected_cluster_commands": 1,  # only one LED to use
                 },
+                Integration.MATTER: {
+                    "expected_cluster_commands": 1,  # only one LED to use
+                },
             },
             "expected_states": {"switch.doors_open_notification": "off"},
             "expected_timers": {
@@ -1635,6 +1703,10 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
             "integration_overrides": {
                 (Integration.ZWAVE, "LZW36"): {
                     "expected_cluster_commands": 2,  # only one LED to use
+                },
+                Integration.MATTER: {
+                    "expected_cluster_commands": 2,  # only one LED to use
+                    "perform_snapshots": True,  # snapshot to ensure turn_off is used
                 },
             },
             "expected_states": {"switch.doors_open_notification": "off"},
@@ -1773,6 +1845,12 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
                 Integration.ZWAVE: {  # command unsupported for ZWAVE
                     "expected_events": 0,
                 },
+                Integration.MATTER: {
+                    # command unsupported for MATTER, but no hard coded
+                    # expectations change, so this is also snapshotted to ensure
+                    # that the switch info remains with the override info since
+                    # the command is ignored.
+                },
             },
             "expected_states": {"switch.doors_open_notification": "off"},
             "expected_timers": {
@@ -1815,6 +1893,7 @@ def _response_script(name: str, response: dict[str, Any]) -> dict[str, Any]:
         IntegrationConfig(Integration.Z2M),
         IntegrationConfig(Integration.ZWAVE),
         IntegrationConfig(Integration.ZWAVE, "LZW36"),
+        IntegrationConfig(Integration.MATTER),
     ],
     ids=str,
 )
